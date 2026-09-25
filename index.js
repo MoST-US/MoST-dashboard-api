@@ -208,6 +208,228 @@ function selectCsvFields(rows, requestedFields) {
   });
 }
 
+// Additive (`WORKLOAD_MIXES`) experiments are not tied to a token-interval matrix cell: their
+// experiment folder is named after the canonical mix (parent_dir:
+// `mix_<in_min>-<in_max>_<out_min>-<out_max>@<alpha>+...`, the label's ':' replaced by '_'), the
+// four MIN/MAX_INPUT/OUTPUT_TOKENS columns are intentionally empty in results.csv, and the
+// experiment is described by the WORKLOAD_MIX / ADDITIVE*_PROPORTIONS columns instead. Additive
+// detection is therefore cheap: the folder name starts with `mix_`, or the row carries
+// ADDITIVE=TRUE / a non-empty WORKLOAD_MIX. The rendering mirrors experiment_environment's
+// workload_mix.py::_build_mix so the API reports the same canonical mix the environment wrote.
+const ADDITIVE_EXPERIMENT_PREFIX = "mix_";
+const ADDITIVE_ALPHA_DECIMALS = 6;
+const ADDITIVE_TOKEN_RANGE_RE = /^(\d+)(?:-(\d+))?$/;
+const ADDITIVE_PROFILE_PAIR_RE = /\(([^()]*)\)/g;
+
+function parseAdditiveAlpha(rawAlpha) {
+  const numeric = Number(String(rawAlpha == null ? "" : rawAlpha).trim());
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+}
+
+// Same compact rendering as workload_mix.py::_format_alpha (0.5, 0.333333, 1).
+function formatAdditiveAlpha(alpha) {
+  const text = Number(alpha)
+    .toFixed(ADDITIVE_ALPHA_DECIMALS)
+    .replace(/0+$/, "")
+    .replace(/\.$/, "");
+  return text || "0";
+}
+
+function parseAdditiveTokenRange(text) {
+  const match = ADDITIVE_TOKEN_RANGE_RE.exec(String(text == null ? "" : text).trim());
+  if (!match) {
+    return null;
+  }
+
+  const first = Number(match[1]);
+  const second = match[2] === undefined ? first : Number(match[2]);
+  if (first <= 0 || second <= 0) {
+    return null;
+  }
+
+  return { min: Math.min(first, second), max: Math.max(first, second) };
+}
+
+// Normalises the alphas and derives the canonical mix string and the mix envelope, the same way
+// workload_mix.py::_build_mix does.
+function buildAdditiveMix(profiles) {
+  const total = profiles.reduce((sum, profile) => sum + profile.alpha, 0);
+  if (!(total > 0)) {
+    return null;
+  }
+
+  const normalized = profiles.map((profile) => ({ ...profile, alpha: profile.alpha / total }));
+  const canonical = `[${normalized
+    .map((profile) => `(${profile.label},${formatAdditiveAlpha(profile.alpha)})`)
+    .join(",")}]`;
+
+  return {
+    canonical,
+    profiles: normalized,
+    envelope: {
+      inMin: Math.min(...normalized.map((profile) => profile.inMin)),
+      inMax: Math.max(...normalized.map((profile) => profile.inMax)),
+      outMin: Math.min(...normalized.map((profile) => profile.outMin)),
+      outMax: Math.max(...normalized.map((profile) => profile.outMax)),
+    },
+  };
+}
+
+// Parses an experiment folder name such as `mix_1-100_1-100@0.5+300-600_100-300@0.5`.
+// Returns null when the name is not an additive mix folder or a part is malformed.
+function parseWorkloadMixName(experimentName) {
+  const name = String(experimentName == null ? "" : experimentName).trim();
+  if (!name.toLowerCase().startsWith(ADDITIVE_EXPERIMENT_PREFIX)) {
+    return null;
+  }
+
+  const body = name.slice(ADDITIVE_EXPERIMENT_PREFIX.length);
+  if (!body) {
+    return null;
+  }
+
+  const profiles = [];
+  for (const rawPart of body.split("+")) {
+    const part = rawPart.trim();
+    const atIndex = part.lastIndexOf("@");
+    if (atIndex <= 0) {
+      return null;
+    }
+
+    const alpha = parseAdditiveAlpha(part.slice(atIndex + 1));
+    const intervalParts = part.slice(0, atIndex).split("_");
+    if (alpha === null || intervalParts.length !== 2) {
+      return null;
+    }
+
+    const inRange = parseAdditiveTokenRange(intervalParts[0]);
+    const outRange = parseAdditiveTokenRange(intervalParts[1]);
+    if (!inRange || !outRange) {
+      return null;
+    }
+
+    profiles.push({
+      label: `${inRange.min}-${inRange.max}:${outRange.min}-${outRange.max}`,
+      inMin: inRange.min,
+      inMax: inRange.max,
+      outMin: outRange.min,
+      outMax: outRange.max,
+      alpha,
+    });
+  }
+
+  return profiles.length > 0 ? buildAdditiveMix(profiles) : null;
+}
+
+// Parses the WORKLOAD_MIX column, e.g. `[(1-100:1-100,0.5),(300-600:100-300,0.5)]`.
+function parseCanonicalMix(rawValue) {
+  const text = String(rawValue == null ? "" : rawValue).trim();
+  if (!text) {
+    return null;
+  }
+
+  const profiles = [];
+  ADDITIVE_PROFILE_PAIR_RE.lastIndex = 0;
+  let match;
+  while ((match = ADDITIVE_PROFILE_PAIR_RE.exec(text)) !== null) {
+    const pair = match[1];
+    const commaIndex = pair.lastIndexOf(",");
+    if (commaIndex <= 0) {
+      return null;
+    }
+
+    const alpha = parseAdditiveAlpha(pair.slice(commaIndex + 1));
+    const intervalParts = pair.slice(0, commaIndex).trim().split(":");
+    if (alpha === null || intervalParts.length !== 2) {
+      return null;
+    }
+
+    const inRange = parseAdditiveTokenRange(intervalParts[0]);
+    const outRange = parseAdditiveTokenRange(intervalParts[1]);
+    if (!inRange || !outRange) {
+      return null;
+    }
+
+    profiles.push({
+      label: `${inRange.min}-${inRange.max}:${outRange.min}-${outRange.max}`,
+      inMin: inRange.min,
+      inMax: inRange.max,
+      outMin: outRange.min,
+      outMax: outRange.max,
+      alpha,
+    });
+  }
+
+  return profiles.length > 0 ? buildAdditiveMix(profiles) : null;
+}
+
+// Parses the ADDITIVE_*_PROPORTIONS columns (`{"1-100:1-100":0.5,...}`); null when empty/invalid.
+function parseAdditiveProportions(rawValue) {
+  const text = String(rawValue == null ? "" : rawValue).trim();
+  if (!text) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+
+    const entries = Object.entries(parsed)
+      .map(([label, value]) => [String(label).trim(), Number(value)])
+      .filter(([label, value]) => label && Number.isFinite(value));
+    return entries.length > 0 ? Object.fromEntries(entries) : null;
+  } catch {
+    return null;
+  }
+}
+
+function isAdditiveRow(row) {
+  if (!row || typeof row !== "object") {
+    return false;
+  }
+
+  const flag = firstNonEmpty(row.ADDITIVE, row.additive);
+  if (flag && ["true", "1", "yes"].includes(flag.toLowerCase())) {
+    return true;
+  }
+
+  return Boolean(firstNonEmpty(row.WORKLOAD_MIX, row.workload_mix));
+}
+
+// Descriptor for additive experiments: detection plus the mix metadata and the expected / observed
+// proportions. Falls back from the row columns to the experiment folder name, so it works even when
+// the requested `fields` filter strips the additive columns from the returned rows.
+function buildAdditiveDescriptor(experiment, rows) {
+  const fromName = parseWorkloadMixName(experiment);
+  const row = Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+  const fromRow = row ? parseCanonicalMix(firstNonEmpty(row.WORKLOAD_MIX, row.workload_mix)) : null;
+  const isAdditive = Boolean(fromName || fromRow || isAdditiveRow(row));
+
+  if (!isAdditive) {
+    return { isAdditive: false };
+  }
+
+  const mix = fromRow || fromName;
+  return {
+    isAdditive: true,
+    canonical: mix ? mix.canonical : null,
+    profiles: mix ? mix.profiles : [],
+    envelope: mix ? mix.envelope : null,
+    expectedProportions: row
+      ? parseAdditiveProportions(
+          firstNonEmpty(row.ADDITIVE_EXPECTED_PROPORTIONS, row.additive_expected_proportions),
+        )
+      : null,
+    trueProportions: row
+      ? parseAdditiveProportions(
+          firstNonEmpty(row.ADDITIVE_TRUE_PROPORTIONS, row.additive_true_proportions),
+        )
+      : null,
+  };
+}
+
 function inferGpuFromUrl(rawUrl) {
   const cleaned = stripQuotes(rawUrl);
   if (!cleaned) {
@@ -874,10 +1096,30 @@ app.get("/api/experiments", async (_req, res, next) => {
     const resultsScope = getResultsScopeFromRequest(_req);
     const basePath = await resolveResultsBasePath(resultsScope);
     const experiments = await listExperimentFolders(basePath);
+    // `experiments` stays a plain list of folder names for backward compatibility; the additive
+    // (WORKLOAD_MIXES) subset is described separately, decoded from the `mix_...` folder name.
+    const additiveExperiments = experiments
+      .map((name) => {
+        const mix = parseWorkloadMixName(name);
+        if (!mix) {
+          return null;
+        }
+
+        return {
+          name,
+          isAdditive: true,
+          canonical: mix.canonical,
+          profiles: mix.profiles,
+          envelope: mix.envelope,
+        };
+      })
+      .filter(Boolean);
+
     res.json({
       resultsRoot: toPosixRelative(basePath),
       resultsScope,
       experiments,
+      additiveExperiments,
     });
   } catch (error) {
     next(error);
@@ -1058,6 +1300,9 @@ app.get("/api/experiments/:experiment/iterations/:iteration/results.csv", async 
 
     const requestedFields = getRequestedCsvFields(req);
     const rows = selectCsvFields(parsed.rows, requestedFields);
+    // Additive metadata is derived from the full parsed rows (before field filtering) so it is
+    // still reported when `?fields=` strips the WORKLOAD_MIX / ADDITIVE*_PROPORTIONS columns.
+    const additive = buildAdditiveDescriptor(experiment, parsed.rows);
 
     res.json({
       experiment,
@@ -1068,6 +1313,7 @@ app.get("/api/experiments/:experiment/iterations/:iteration/results.csv", async 
       count: rows.length,
       relaxedParsing: parsed.relaxed,
       source: toPosixRelative(csvPath),
+      additive,
     });
   } catch (error) {
     next(error);
