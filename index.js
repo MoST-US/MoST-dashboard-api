@@ -1,4 +1,5 @@
 ﻿const fs = require("node:fs/promises");
+const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 const https = require("node:https");
@@ -22,6 +23,7 @@ const resultsRoot = path.resolve(projectRoot, process.env.RESULTS_DIR || "result
 const DEFAULT_RESULTS_SCOPE = "current";
 const SLURM_LOG_PATTERN = /^slurm-(\d+)\.out$/;
 const SQUEUE_TIMEOUT_MS = 10000;
+const MERGE_RESULTS_TIMEOUT_MS = Number(process.env.MERGED_RESULTS_TIMEOUT || 120) * 1000;
 
 function toPosixRelative(targetPath) {
   return path.relative(projectRoot, targetPath).split(path.sep).join("/");
@@ -942,6 +944,12 @@ function runPythonCaptureJson(scriptPath, args, timeoutMs = SQUEUE_TIMEOUT_MS) {
       stdout += chunk;
     });
 
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+
     const fail = () => resolve(null);
     child.on("error", fail);
     child.on("timeout", fail);
@@ -952,7 +960,7 @@ function runPythonCaptureJson(scriptPath, args, timeoutMs = SQUEUE_TIMEOUT_MS) {
       } catch {
         // stdout was not JSON; treat as an unparseable outcome below.
       }
-      resolve({ exited: code, data });
+      resolve({ exited: code, data, stderr });
     });
   });
 }
@@ -987,6 +995,73 @@ async function findModelJobGpuCount({ modelId, node, port }) {
 
   const error = new Error(captured.data.error);
   error.code = "JOB_NOT_FOUND";
+  throw error;
+}
+
+function resolveMergeResultsScriptPath() {
+  return path.join(
+    projectRoot,
+    "fmperf",
+    "utils",
+    "MergeResultsCsv.py",
+  );
+}
+
+function parseExperimentList(rawExperiments) {
+  const values = Array.isArray(rawExperiments) ? rawExperiments : [rawExperiments];
+  const experiments = [];
+
+  for (const value of values) {
+    for (const token of String(value || "").split(",")) {
+      const name = token.trim();
+      if (name && !experiments.includes(name)) {
+        experiments.push(name);
+      }
+    }
+  }
+
+  return experiments;
+}
+
+async function removeTempDirectory(tempDir) {
+  if (!tempDir) {
+    return;
+  }
+  await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+}
+
+async function buildMergedResultsCsv(basePath, experiments) {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "most-merged-results-"));
+  const csvPath = path.join(tempDir, "merged-results.csv");
+  const args = ["merge", "--root", basePath, "--output", csvPath];
+  if (experiments.length > 0) {
+    args.push("--experiments", experiments.join(","));
+  }
+
+  const captured = await runPythonCaptureJson(
+    resolveMergeResultsScriptPath(),
+    args,
+    MERGE_RESULTS_TIMEOUT_MS,
+  );
+
+  if (captured && captured.exited === 0 && !(captured.data && captured.data.error)) {
+    return { tempDir, csvPath };
+  }
+
+  await removeTempDirectory(tempDir);
+
+  if (captured && captured.stderr && captured.stderr.trim()) {
+    console.error(`Merged CSV helper failed: ${captured.stderr.trim()}`);
+  }
+
+  const helperError = captured && captured.data ? captured.data : null;
+  const error = new Error(
+    (helperError && helperError.error) || "The merged CSV helper is unavailable.",
+  );
+  error.code =
+    helperError && helperError.code === "NO_RESULTS_FOUND"
+      ? "NO_RESULTS_FOUND"
+      : "MERGE_HELPER_UNAVAILABLE";
   throw error;
 }
 
@@ -1348,6 +1423,28 @@ app.get("/api/experiments/:experiment/iterations/:iteration/download/results.jso
   }
 });
 
+app.get("/api/experiments/download/merged-results.csv", async (req, res, next) => {
+  let tempDir = null;
+
+  try {
+    const resultsScope = getResultsScopeFromRequest(req);
+    const basePath = await resolveResultsBasePath(resultsScope);
+    const experiments = parseExperimentList(req.query.experiments);
+    const merged = await buildMergedResultsCsv(basePath, experiments);
+    tempDir = merged.tempDir;
+
+    res.download(merged.csvPath, "matrix-results-merged.csv", (error) => {
+      removeTempDirectory(tempDir);
+      if (error && !res.headersSent) {
+        next(error);
+      }
+    });
+  } catch (error) {
+    await removeTempDirectory(tempDir);
+    next(error);
+  }
+});
+
 app.use((error, _req, res, _next) => {
   let status = 500;
   let message = "Unexpected server error.";
@@ -1378,6 +1475,12 @@ app.use((error, _req, res, _next) => {
     message = error.message;
   } else if (error && error.code === "JOB_NOT_FOUND") {
     status = 404;
+    message = error.message;
+  } else if (error && error.code === "NO_RESULTS_FOUND") {
+    status = 404;
+    message = error.message;
+  } else if (error && error.code === "MERGE_HELPER_UNAVAILABLE") {
+    status = 503;
     message = error.message;
   }
 
