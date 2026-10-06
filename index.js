@@ -24,6 +24,9 @@ const DEFAULT_RESULTS_SCOPE = "current";
 const SLURM_LOG_PATTERN = /^slurm-(\d+)\.out$/;
 const SQUEUE_TIMEOUT_MS = 10000;
 const MERGE_RESULTS_TIMEOUT_MS = Number(process.env.MERGED_RESULTS_TIMEOUT || 120) * 1000;
+const CONVERT_RESULTS_TIMEOUT_MS = Number(process.env.CONVERT_RESULTS_TIMEOUT || 120) * 1000;
+const RESULTS_FROM_JSON_FILENAME = "results_from_json.csv";
+const conversionsInProgress = new Map();
 
 function toPosixRelative(targetPath) {
   return path.relative(projectRoot, targetPath).split(path.sep).join("/");
@@ -965,6 +968,117 @@ function runPythonCaptureJson(scriptPath, args, timeoutMs = SQUEUE_TIMEOUT_MS) {
   });
 }
 
+async function resolveConvertResultsScriptPath() {
+  const candidates = [
+    path.join(projectRoot, "MoST-experiment-environment", "requests", "convert_to_csv.py"),
+    path.join(projectRoot, "requests", "convert_to_csv.py"),
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate);
+      return candidate;
+    } catch {
+      // Try the next supported project layout.
+    }
+  }
+
+  const error = new Error("The results conversion helper is unavailable.");
+  error.code = "RESULTS_CONVERSION_UNAVAILABLE";
+  throw error;
+}
+
+function runPythonCaptureOutput(scriptPath, args, timeoutMs) {
+  return new Promise((resolve) => {
+    let child;
+    let settled = false;
+    let timedOut = false;
+
+    const finish = (result) => {
+      if (!settled) {
+        settled = true;
+        resolve(result);
+      }
+    };
+
+    try {
+      child = spawn(process.env.PYTHON || "python", [scriptPath, ...args], {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: timeoutMs,
+      });
+    } catch (error) {
+      finish({ error });
+      return;
+    }
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => {
+      if (error.code === "ETIMEDOUT") {
+        timedOut = true;
+      }
+      finish({ error, timedOut, stdout, stderr });
+    });
+    child.on("timeout", () => {
+      timedOut = true;
+    });
+    child.on("close", (code) => {
+      finish({ code, timedOut, stdout, stderr });
+    });
+  });
+}
+
+async function ensureResultsFromJsonCsv(jsonPath, csvPath) {
+  try {
+    await fs.access(csvPath);
+    return;
+  } catch {
+    // Generate the derived file only when it is not already present.
+  }
+
+  const conversion = conversionsInProgress.get(csvPath);
+  if (conversion) {
+    await conversion;
+    return;
+  }
+
+  const promise = (async () => {
+    await requireExistingFile(jsonPath);
+    const scriptPath = await resolveConvertResultsScriptPath();
+    const captured = await runPythonCaptureOutput(
+      scriptPath,
+      [jsonPath, csvPath],
+      CONVERT_RESULTS_TIMEOUT_MS,
+    );
+
+    if (captured.error || captured.timedOut || captured.code !== 0) {
+      if (captured.stderr && captured.stderr.trim()) {
+        console.error(`Results CSV conversion failed: ${captured.stderr.trim()}`);
+      }
+      const error = new Error("Unable to convert results.json to CSV.");
+      error.code = "RESULTS_CONVERSION_FAILED";
+      throw error;
+    }
+
+    await requireExistingFile(csvPath);
+  })();
+
+  conversionsInProgress.set(csvPath, promise);
+  try {
+    await promise;
+  } finally {
+    conversionsInProgress.delete(csvPath);
+  }
+}
+
 async function findModelJobGpuCount({ modelId, node, port }) {
   const scriptPath = resolveGpuCountScriptPath();
   const captured = await runPythonCaptureJson(scriptPath, [
@@ -1423,6 +1537,22 @@ app.get("/api/experiments/:experiment/iterations/:iteration/download/results.jso
   }
 });
 
+app.get("/api/experiments/:experiment/iterations/:iteration/download/results_from_json.csv", async (req, res, next) => {
+  try {
+    const { experiment, iteration } = req.params;
+    const resultsScope = getResultsScopeFromRequest(req);
+    const basePath = await resolveResultsBasePath(resultsScope);
+    const iterationPath = safeJoin(basePath, experiment, iteration);
+    const jsonPath = safeJoin(iterationPath, "results.json");
+    const csvPath = safeJoin(iterationPath, RESULTS_FROM_JSON_FILENAME);
+
+    await ensureResultsFromJsonCsv(jsonPath, csvPath);
+    res.download(csvPath, RESULTS_FROM_JSON_FILENAME);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/experiments/download/merged-results.csv", async (req, res, next) => {
   let tempDir = null;
 
@@ -1481,6 +1611,12 @@ app.use((error, _req, res, _next) => {
     message = error.message;
   } else if (error && error.code === "MERGE_HELPER_UNAVAILABLE") {
     status = 503;
+    message = error.message;
+  } else if (error && error.code === "RESULTS_CONVERSION_UNAVAILABLE") {
+    status = 503;
+    message = error.message;
+  } else if (error && error.code === "RESULTS_CONVERSION_FAILED") {
+    status = 422;
     message = error.message;
   }
 
