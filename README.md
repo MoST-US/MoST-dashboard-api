@@ -27,6 +27,7 @@ By default, the API listens on `http://localhost:4000`.
 - `GET /api/experiments/:experiment/iterations/:iteration/download/results.csv`
 - `GET /api/experiments/:experiment/iterations/:iteration/download/results.json`
 - `GET /api/experiments/:experiment/iterations/:iteration/download/results_from_json.csv` — downloads the converted per-request CSV, generating it with `MoST-experiment-environment/requests/convert_to_csv.py` when it is missing.
+- `POST /api/experiments/:experiment/ensure-results-from-json?resultsScope=SCOPE` — generates, in a single pass, the derived `results_from_json.csv` of every iteration of the experiment that is still missing it (same `convert_to_csv.py` helper, run once for the whole folder with `--batch-dir` instead of once per file) and returns `{ experiment, resultsScope, converted, skipped, failed }`. The dashboard calls it before uploading, so the per-file `results_from_json.csv` download below becomes a cache hit rather than a fresh Python run.
 - `GET /api/experiments/download/merged-results.csv?resultsScope=SCOPE[&experiments=a,b,c]` — merges the `results.csv` files of the scope into a single CSV, downloaded as `matrix-results-merged.csv`. `experiments` is an optional comma separated list of experiment folders (the dashboard sends the matrix cells); without it, every non-additive folder of the scope is merged. Delegates to the shared `MoST-experiment-environment/fmperf/utils/MergeResultsCsv.py` helper (see Notes).
 
 ## Notes

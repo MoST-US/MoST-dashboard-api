@@ -25,7 +25,11 @@ const SLURM_LOG_PATTERN = /^slurm-(\d+)\.out$/;
 const SQUEUE_TIMEOUT_MS = 10000;
 const MERGE_RESULTS_TIMEOUT_MS = Number(process.env.MERGED_RESULTS_TIMEOUT || 120) * 1000;
 const CONVERT_RESULTS_TIMEOUT_MS = Number(process.env.CONVERT_RESULTS_TIMEOUT || 120) * 1000;
+// A batch pass converts every iteration of one experiment, so it legitimately runs far longer
+// than a single file; the caller streams its prepared CSVs as plain cache hits afterwards.
+const CONVERT_RESULTS_BATCH_TIMEOUT_MS = Number(process.env.CONVERT_RESULTS_BATCH_TIMEOUT || 3600) * 1000;
 const RESULTS_FROM_JSON_FILENAME = "results_from_json.csv";
+const RESULTS_FROM_JSON_BATCH_SUMMARY_PATTERN = /batch summary:\s*converted=(\d+)\s+skipped=(\d+)\s+failed=(\d+)/;
 const conversionsInProgress = new Map();
 
 function toPosixRelative(targetPath) {
@@ -1079,6 +1083,57 @@ async function ensureResultsFromJsonCsv(jsonPath, csvPath) {
   }
 }
 
+function parseResultsFromJsonBatchSummary(stdout) {
+  const match = RESULTS_FROM_JSON_BATCH_SUMMARY_PATTERN.exec(String(stdout || ""));
+  if (!match) {
+    return { converted: 0, skipped: 0, failed: 0 };
+  }
+  return {
+    converted: Number(match[1]),
+    skipped: Number(match[2]),
+    failed: Number(match[3]),
+  };
+}
+
+// Fills in the derived results_from_json.csv of every iteration of one experiment folder in a
+// single Python pass. The dashboard streams that CSV per iteration while it uploads, and deriving
+// it lazily (one interpreter per file, interleaved with the upload) is what made a large sweep
+// stall; preparing the whole experiment up front turns every per-file download into a cache hit.
+// Concurrent callers for the same experiment share one run.
+async function ensureExperimentResultsFromJsonCsv(experimentDir) {
+  const conversion = conversionsInProgress.get(experimentDir);
+  if (conversion) {
+    return conversion;
+  }
+
+  const promise = (async () => {
+    const scriptPath = await resolveConvertResultsScriptPath();
+    const captured = await runPythonCaptureOutput(
+      scriptPath,
+      ["--batch-dir", experimentDir],
+      CONVERT_RESULTS_BATCH_TIMEOUT_MS,
+    );
+
+    if (captured.error || captured.timedOut || captured.code !== 0) {
+      if (captured.stderr && captured.stderr.trim()) {
+        console.error(`Results CSV batch conversion failed: ${captured.stderr.trim()}`);
+      }
+      const error = new Error("Unable to convert the experiment's results.json files to CSV.");
+      error.code = "RESULTS_CONVERSION_FAILED";
+      throw error;
+    }
+
+    return parseResultsFromJsonBatchSummary(captured.stdout);
+  })();
+
+  conversionsInProgress.set(experimentDir, promise);
+  try {
+    return await promise;
+  } finally {
+    conversionsInProgress.delete(experimentDir);
+  }
+}
+
 async function findModelJobGpuCount({ modelId, node, port }) {
   const scriptPath = resolveGpuCountScriptPath();
   const captured = await runPythonCaptureJson(scriptPath, [
@@ -1532,6 +1587,22 @@ app.get("/api/experiments/:experiment/iterations/:iteration/download/results.jso
       safeJoin(basePath, experiment, iteration, "results.json"),
     );
     res.download(jsonPath, "results.json");
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Prepares every derived results_from_json.csv of an experiment in one pass so the upload that
+// follows streams plain cache hits. Idempotent: existing CSVs are skipped, missing ones are
+// generated, and the summary lets the caller report what happened.
+app.post("/api/experiments/:experiment/ensure-results-from-json", async (req, res, next) => {
+  try {
+    const { experiment } = req.params;
+    const resultsScope = getResultsScopeFromRequest(req);
+    const basePath = await resolveResultsBasePath(resultsScope);
+    const experimentDir = safeJoin(basePath, experiment);
+    const summary = await ensureExperimentResultsFromJsonCsv(experimentDir);
+    res.json({ experiment, resultsScope, ...summary });
   } catch (error) {
     next(error);
   }
